@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(我这是在服务器运行的代码，本地跑不了，\\(siu3r_custom_t25\\) lichangbai@amax:/data3/congwenjie/siu_pro_v2$ python -c \"import json; data=json.load\\(open\\(r'/data3/congwenjie/siu_pro_v2/src/data/SIU3R_DATASET/val_refer_seg_data.json'\\)\\); s=data.get\\('scene0011_00'\\); print\\('scene0011_00' in data\\); print\\(s.get\\('objects',{}\\).get\\('3','NOT FOUND'\\) if s else 'scene not found'\\)\"\rTrue\r{'object_name': 'table', 'instance_label_id': 5, 'panoptic_label_id': 7, 'text': ['this is a long table. there are three brown chairs behind it.', 'this is a long table. it is surrounded by chairs.', 'there is a large table in the room. it has ten chairs pulled up to it.', 'a brown table, placed in the middle of the room, on the left is 4 brown chairs, on the right are 4 brown chairs. the front is a brown door with light shining on.', 'this is a brown table. it is surrounded by quite a few matching chairs.'], 'text_token': [[49406, 589, 533, 320, 1538, 2175, 269, 997, 631, 2097, 2866, 12033, 2403, 585, 269, 49407, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [49406, 589, 533, 320, 1538, 2175, 269, 585, 533, 13589, 638, 12033, 269, 49407, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [49406, 997, 533, 320, 3638, 2175, 530, 518, 1530, 269, 585, 791, 2581, 12033, 8525, 705, 531, 585, 269, 49407, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [49406, 320, 2866, 2175, 267, 9729, 530, 518, 3694, 539, 518, 1530, 267, 525, 518, 1823, 533, 275, 2866, 12033, 267, 525, 518, 1155, 631, 275, 2866, 12033, 269, 518, 2184, 533, 320, 2866, 2489, 593, 1395, 10485, 525, 269, 49407, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [49406, 589, 533, 320, 2866, 2175, 269, 585, 533, 13589, 638, 4135, 320, 1939, 11840, 12033, 269, 49407, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]})",
+      "Bash(python *)",
+      "Read(//d/code/paper/SIU3R-main/**)",
+      "Read(//mnt/d/code/paper/**)",
+      "Bash(\"D:\\\\code\\\\paper\\\\siu_pro_v2\\\\src\\\\data\\\\SIU3R_DATASET\"\\\\val_refer_seg_data.json *)",
+      "Bash(pip install *我在服务器配的环境)",
+      "Bash(pip install * 服务器下载的)"
+    ]
+  }
+}

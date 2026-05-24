@@ -1,0 +1,21 @@
+更正确版本
+1. 3D 侧
+AnySplat 几何主干先预测 3D 点/中心，gaussian_param_head 再预测每个 Gaussian 的属性，比如 opacity、scale、rotation 和语义相关特征。
+2. 语义侧
+SAM3 输出 2D mask / logits / query-class logits。
+3. 语义 lift 到 3D
+利用几何对应关系，把 2D query-class logits 附着到 3D Gaussian 上，而不是直接在 3D 里生出 query。
+4. 渲染回 2D
+把带语义属性的 3D Gaussian 渲染回 2D，得到语义 logits map / mask-like prediction。
+5. 与 GT 比较
+将渲染得到的 2D 预测图和 GT mask 计算损失，比如交叉熵或其他 segmentation loss。
+6. 反向传播
+如果预测不对，误差通过可微投影和渲染链回传，更新参与训练的模块参数，从而间接改变 Gaussian 的几何、属性和最终 2D logits。
+你原话里最需要纠正的一句
+你原话：
+> 如果没对上：修改 3D Query 的特征，进而改变 gaussian_param_head 输出的几何形状或 logits 得分。
+更准确应改成：
+> 如果没对上：损失会通过可微渲染与投影链反向传播，更新当前可训练参数，从而间接改变 Gaussian 的属性、几何表现以及渲染后的 logits。
+
+
+反向传播不是很懂如何更新参数

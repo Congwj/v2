@@ -1,0 +1,72 @@
+defaults: []
+
+project: siu_pro_v2
+experiment: dev
+wandb_mode: offline
+ckpt_path: null
+mode: train
+seed: 0
+ignore_warnings: true
+
+trainer:
+  max_epochs: 20
+  accelerator: gpu
+  strategy: auto
+  devices: 1
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.5
+  gradient_checkpointing: true
+  check_val_every_n_epoch: 100
+  log_every_n_steps: 5
+  skip_sanity_check: true
+  precision: "32"
+
+optimizer:
+  lr: 1e-5
+  warm_up_epochs: 3
+  weight_decay: 0.01
+  eps: 1e-4
+  eta_min_ratio: 0.05
+
+training:
+  batch_size: 1
+  num_epochs: 20
+  log_training_result_interval: 400
+  feature_distill:
+    weight: 1.0
+  use_vote_head: true
+  dataloader:
+    num_workers: 2
+    pin_memory: true
+
+model:
+  image_size: [448, 448]
+  backbone:
+    feature_dim: 2048
+    freeze_encoder: true
+    freeze_gaussian_head: true
+    checkpoint: "src/pretrained_weights/model.safetensors"
+  sam3:
+    freeze_sam3: true
+    freeze_sam3_backbone: true
+    train_sam3_decoder: false
+    skip_for_training: true
+    num_classes: 1
+    num_queries: 24
+    checkpoint: "src/pretrained_weights/sam3.pt"
+  gaussian_adapter:
+    feature_dim: 2048
+    sh_degree: 4
+    num_points: 3000
+    gaussian_scale_min: 0.01
+    gaussian_scale_max: 0.3
+    voxel_size: 0.02
+    voxelize: true
+
+data:
+  dataset_root: src/data/SIU3R_DATASET
+  split: train
+  num_views: 3
+  frame_stride: 20
+  max_train_samples: 1000
+  max_val_samples: 64
