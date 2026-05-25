@@ -43,6 +43,7 @@ def render_cuda_gsplat(
     h, w = image_shape
     all_colors = []
     all_depths = []
+    visibility_logged = False
 
     for view_idx in range(total_views):
         viewmats_w2c = extrinsics[view_idx].float().inverse()
@@ -66,17 +67,54 @@ def render_cuda_gsplat(
             colors = torch.ones(means.shape[0], 3, device=device, dtype=torch.float32) * 0.5
             sh_degree = None
 
+        if not visibility_logged:
+            ones = torch.ones(means.shape[0], 1, device=device, dtype=means.dtype)
+            means_h = torch.cat([means, ones], dim=-1)
+            cam_points = means_h @ viewmats_w2c.transpose(0, 1)
+            z_vals = cam_points[:, 2]
+            positive_mask = z_vals > 0
+            in_image_count = 0
+            if positive_mask.any():
+                z_pos = z_vals[positive_mask]
+                x_pix = k_px[0, 0] * (cam_points[positive_mask, 0] / z_pos) + k_px[0, 2]
+                y_pix = k_px[1, 1] * (cam_points[positive_mask, 1] / z_pos) + k_px[1, 2]
+                in_image = (x_pix >= 0) & (x_pix < w) & (y_pix >= 0) & (y_pix < h)
+                in_image_count = int(in_image.sum().item())
+                print(
+                    "[gsplat] AnySplat-source projection stats: "
+                    f"fx={k_px[0, 0].item():.4f}, fy={k_px[1, 1].item():.4f}, "
+                    f"cx={k_px[0, 2].item():.4f}, cy={k_px[1, 2].item():.4f}, "
+                    f"x[min={x_pix.min().item():.4f}, max={x_pix.max().item():.4f}, mean={x_pix.mean().item():.4f}], "
+                    f"y[min={y_pix.min().item():.4f}, max={y_pix.max().item():.4f}, mean={y_pix.mean().item():.4f}]"
+                )
+            scale_mean = scales.mean().item() if isinstance(scales, torch.Tensor) else float("nan")
+            print(
+                "[gsplat] AnySplat-source visibility stats: "
+                f"total={means.shape[0]}, positive_z={int(positive_mask.sum().item())}, in_image={in_image_count}, "
+                f"mean_z={z_vals.mean().item():.4f}, min_z={z_vals.min().item():.4f}, max_z={z_vals.max().item():.4f}, "
+                f"mean_opacity={opacities.mean().item():.4f}, mean_scale={scale_mean:.4f}"
+            )
+            visibility_logged = True
+
         rendered_colors, rendered_alphas, info = gsplat_rasterize(
-            means=means, quats=quats, scales=scales, opacities=opacities, colors=colors,
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
             viewmats=viewmats_w2c.unsqueeze(0).contiguous(),
             Ks=k_px.unsqueeze(0).contiguous(),
-            width=int(w), height=int(h),
+            width=int(w),
+            height=int(h),
             sh_degree=sh_degree,
             near_plane=1e-10,
             far_plane=float(far[view_idx]) if far.dim() > 0 else float(far),
-            render_mode="RGB+D", packed=False,
+            render_mode="RGB+D",
+            packed=False,
             backgrounds=background_color[view_idx].unsqueeze(0) if background_color.dim() == 2 else background_color.unsqueeze(0),
-            radius_clip=0.1, covars=covars, rasterize_mode="classic",
+            radius_clip=0.1,
+            covars=covars,
+            rasterize_mode="classic",
         )
 
         rendered_rgbd = rendered_colors[0] if rendered_colors.dim() == 4 else rendered_colors
@@ -92,6 +130,15 @@ def render_cuda_gsplat(
                     depth = info_depths[0].contiguous()
                 elif info_depths.dim() == 2 and info_depths.shape == (h, w):
                     depth = info_depths.contiguous()
+
+        if view_idx == 0:
+            nonzero_rgb = int((rgb.abs().sum(dim=0) > 0).sum().item())
+            nonzero_depth = int((depth > 0).sum().item())
+            print(
+                "[gsplat] raster output stats: "
+                f"nonzero_rgb_pixels={nonzero_rgb}, nonzero_depth_pixels={nonzero_depth}, "
+                f"rgb_mean={rgb.mean().item():.4f}, depth_mean={depth.mean().item():.4f}"
+            )
 
         all_colors.append(rgb)
         all_depths.append(depth)

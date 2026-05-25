@@ -25,14 +25,14 @@ optimizer:
   lr: 1e-5
   warm_up_epochs: 3
   weight_decay: 0.01
-  eps: 1e-4
-  eta_min_ratio: 0.05
 
 training:
   batch_size: 1
   num_epochs: 20
+  weight_depth_smoothness: 0.05
   log_training_result_interval: 400
   feature_distill:
+    enabled: true
     weight: 1.0
   use_vote_head: true
   dataloader:
@@ -41,11 +41,21 @@ training:
 
 model:
   image_size: [448, 448]
+  device: cuda
   backbone:
+    type: anysplat
+    backbone: croco
     feature_dim: 2048
     freeze_encoder: true
     freeze_gaussian_head: true
+    use_adapter: true
+    adapter_dim: 64
     checkpoint: "src/pretrained_weights/model.safetensors"
+    pred_head_type: depth
+    encoder_params:
+      enc_depth: 24
+      enc_embed_dim: 1024
+      patch_size: 16
   sam3:
     freeze_sam3: true
     freeze_sam3_backbone: true
@@ -61,12 +71,12 @@ model:
     gaussian_scale_min: 0.01
     gaussian_scale_max: 0.3
     voxel_size: 0.02
-    voxelize: true
 
 data:
   dataset_root: src/data/SIU3R_DATASET
   split: train
   num_views: 3
   frame_stride: 20
+  target_offset_mult: 2
   max_train_samples: 1000
   max_val_samples: 64

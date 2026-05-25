@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -23,72 +23,95 @@ class FusedSystemOutput:
 
 class VoteHead(nn.Module):
     """GNeSF GeneralRenderingNetwork adapted for Gaussian splatting.
-    base_fc → vis_fc → vis_fc2 → sem_fc, with independent blending per query.
-    Reference: GNeSF-3D/models/mlp_network.py GeneralRenderingNetwork (lines 26-145)."""
-    def __init__(self, num_views=3, num_classes=1, hidden_dim=32):
+    Per-gaussian (not per-query): all Q queries share V blending weights.
+    base_fc → vis_fc → vis_fc2 → sem_fc → softmax over V.
+    Reference: GNeSF-3D/models/mlp_network.py GeneralRenderingNetwork."""
+    def __init__(self, num_classes=1, hidden_dim=32):
         super().__init__()
         C = num_classes + 1
-        V = num_views
         H = hidden_dim
-        self.H = H
-        # base_fc: shared per-view feature extractor (GNeSF line 50-54)
+        # base_fc: [x(C), mean(2C), vis(1)] → 3C+1 (GNeSF line 50-54, +visibility gate)
         self.base_fc = nn.Sequential(
-            nn.Linear(C, H), nn.ELU(),
-            nn.Linear(H, H), nn.ELU(),
+            nn.Linear(C * 3 + 1, H * 2), nn.ELU(),
+            nn.Linear(H * 2, H), nn.ELU(),
         )
         # vis_fc: residual + visibility (GNeSF line 56-60)
         self.vis_fc = nn.Sequential(
             nn.Linear(H, H), nn.ELU(),
             nn.Linear(H, H + 1), nn.ELU(),
         )
-        # vis_fc2: refine visibility (GNeSF line 62-66)
+        # vis_fc2: refined visibility (GNeSF line 62-66)
         self.vis_fc2 = nn.Sequential(
             nn.Linear(H, H), nn.ELU(),
             nn.Linear(H, 1), nn.Sigmoid(),
         )
-        # sem_fc: features + visibility → blending logit (GNeSF line 75-79)
+        # sem_fc: [features, visibility] → blend logit (GNeSF line 75-79)
         self.sem_fc = nn.Sequential(
             nn.Linear(H + 1, H // 2), nn.ELU(),
             nn.Linear(H // 2, H // 4), nn.ELU(),
             nn.Linear(H // 4, 1),
         )
-        # Zero-init last layer: untrained VoteHead → uniform blending ≈ mean
+        # GNeSF weights_init: all Linear layers kaiming_normal + zero bias (GNeSF line 12-16)
+        for module in [self.base_fc, self.vis_fc, self.vis_fc2, self.sem_fc]:
+            for m in module:
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        # Override sem_fc last layer to zero: untrained → uniform blending
         nn.init.zeros_(self.sem_fc[-1].weight)
         nn.init.zeros_(self.sem_fc[-1].bias)
 
     def forward(self, per_view_logits):
-        # per_view_logits: [BN, V, Q, C]
-        BN, V, Q, C = per_view_logits.shape
-        x = per_view_logits.reshape(BN * Q, V, C)  # [BN*Q, V, C]
-        x = self.base_fc(x)  # [BN*Q, V, H]
-        x_vis = self.vis_fc(x)  # [BN*Q, V, H+1]
-        x_res, vis = torch.split(x_vis, [self.H, 1], dim=-1)
+        # per_view_logits: [B, N, V, Q, C+1] where C+1 = [logits(C), visibility(1)]
+        B, N, V, Q, Cp1 = per_view_logits.shape
+        C = Cp1 - 1  # visibility is the last channel
+        x = per_view_logits.permute(0, 1, 3, 2, 4).reshape(B * N * Q, V, Cp1)  # [B*N*Q, V, C+1]
+        x_raw = x[..., :C]  # [B*N*Q, V, C] — SAM3 logits
+        vis = x[..., C:]    # [B*N*Q, V, 1] — visibility gate
+        mean = x_raw.mean(dim=1, keepdim=True)  # [B*N*Q, 1, C]
+        var = ((x_raw - mean) ** 2).mean(dim=1, keepdim=True)  # [B*N*Q, 1, C]
+        globalfeat = torch.cat([mean, var], dim=-1).expand(-1, V, -1)  # [B*N*Q, V, 2*C]
+        # base_fc: [globalfeat(2C), raw_logits(C), visibility(1)] (GNeSF + visibility gate)
+        x = self.base_fc(torch.cat([globalfeat, x_raw, vis], dim=-1))  # [B*N*Q, V, H]
+        # vis_fc: residual + visibility (GNeSF line 125-127)
+        x_vis = self.vis_fc(x)  # [B*N*Q, V, H+1]
+        x_res, vis = torch.split(x_vis, [x_vis.shape[-1] - 1, 1], dim=-1)
         vis = torch.sigmoid(vis)
         x = x + x_res
+        # vis_fc2: refined visibility (GNeSF line 129)
         vis = self.vis_fc2(x * vis)
+        # sem_fc: [features, visibility] → per-view blend logit (GNeSF line 132-142)
         sem_input = torch.cat([x, vis], dim=-1)
-        blend_logits = self.sem_fc(sem_input).squeeze(-1)
-        weights = F.softmax(blend_logits, dim=-1)
-        return weights.reshape(BN, Q, V)
+        blend_logits = self.sem_fc(sem_input).squeeze(-1)  # [B*N*Q, V]
+        weights = F.softmax(blend_logits, dim=-1)  # [B*N*Q, V]
+        # Average weights across Q (all queries share the same blending for this gaussian)
+        weights = weights.reshape(B, N, Q, V).mean(dim=2)  # [B, N, V]
+        return weights
 
 
 class FusedSystem(nn.Module):
     def __init__(
         self,
+        sam3_model: Optional[nn.Module] = None,
+        sam3_processor: Optional[nn.Module] = None,
         img_size: int = 512,
         num_classes: int = 1,
         num_queries: int = 50,
         use_sam3_api: bool = True,
         sam3_checkpoint: str = "src/pretrained_weights/sam3.pt",
         anysplat_checkpoint: Optional[str] = None,
+        use_anysplat_pretrained: bool = True,
         freeze_sam3: bool = True,
         freeze_sam3_backbone: bool = True,
         train_sam3_decoder: bool = False,
-        freeze_gaussian_head: bool = True,
+        freeze_gaussian_head: bool = False,
         freeze_backbone: bool = True,
         feature_dim: int = 2048,
         sh_degree: int = 2,
         num_points: int = 5000,
+        use_replica_camera_context: bool = False,
+        anysplat_pred_head_type: str = "point",
         gaussian_scale_min: float = 0.01,
         gaussian_scale_max: float = 0.3,
         voxel_size: float = 0.02,
@@ -97,7 +120,11 @@ class FusedSystem(nn.Module):
     ):
         super().__init__()
         self.img_size = img_size
+        self.num_classes = num_classes
+        self.num_queries = num_queries
+        self.use_replica_camera_context = use_replica_camera_context
         self.use_vote_head = use_vote_head
+        self._has_logged_trainable_parameters = False
 
         gaussian_cfg = GaussianAdapterCfg(
             gaussian_scale_min=gaussian_scale_min,
@@ -128,7 +155,7 @@ class FusedSystem(nn.Module):
             gs_prune=False,
             opacity_threshold=0.001,
             gs_keep_ratio=1.0,
-            pred_head_type="depth",
+            pred_head_type=anysplat_pred_head_type,
             freeze_backbone=freeze_backbone,
             freeze_module="all" if freeze_backbone else "None",
             distill=False,
@@ -143,10 +170,17 @@ class FusedSystem(nn.Module):
             for module in [self.anysplat_encoder.gaussian_param_head, self.anysplat_encoder.gaussian_adapter]:
                 for param in module.parameters():
                     param.requires_grad = False
-        self.vote_head = VoteHead(num_views=3, num_classes=num_classes) if use_vote_head else None
+        if not freeze_backbone:
+            for head in [self.anysplat_encoder.camera_head, self.anysplat_encoder.depth_head]:
+                for param in head.parameters():
+                    param.requires_grad = True
+        self.vote_head = VoteHead(num_classes=num_classes) if use_vote_head else None
         if use_sam3_api:
             self.sam3_segmenter = SAM3Segmenter(
+                sam3_model=sam3_model,
+                sam3_processor=sam3_processor,
                 num_classes=num_classes,
+                use_sam3_api=True,
                 num_queries=num_queries,
                 sam3_checkpoint=sam3_checkpoint,
                 freeze_sam3=freeze_sam3,
@@ -161,7 +195,34 @@ class FusedSystem(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def _resolve_camera_context(self, encoder_output, intrinsics, extrinsics):
+    def _log_trainable_parameters_once(self) -> None:
+        if self._has_logged_trainable_parameters:
+            return
+        trainable_params = []
+        for module_name, module in [
+            ("anysplat_encoder", self.anysplat_encoder),
+            ("sam3_segmenter", self.sam3_segmenter),
+        ]:
+            if module is None:
+                continue
+            param_count = sum(param.numel() for param in module.parameters() if param.requires_grad)
+            if param_count > 0:
+                trainable_params.append(f"{module_name}={param_count}")
+        if trainable_params:
+            print(f"[FusedSystem] trainable parameters: {', '.join(trainable_params)}")
+        else:
+            print("[FusedSystem] trainable parameters: none")
+        self._has_logged_trainable_parameters = True
+
+    def _resolve_camera_context(
+        self,
+        encoder_output,
+        gaussians: Gaussians,
+        intrinsics: torch.Tensor,
+        extrinsics: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_replica_camera_context or encoder_output is None:
+            return intrinsics, extrinsics
         pred_context_pose = getattr(encoder_output, "pred_context_pose", None)
         if not isinstance(pred_context_pose, dict):
             return intrinsics, extrinsics
@@ -169,69 +230,57 @@ class FusedSystem(nn.Module):
         replica_extrinsics = pred_context_pose.get("extrinsic")
         if not isinstance(replica_intrinsics, torch.Tensor) or not isinstance(replica_extrinsics, torch.Tensor):
             return intrinsics, extrinsics
-        # pred_context_pose["extrinsic"] is already c2w (AnySplat internally inverts the raw w2c output)
-        return replica_intrinsics, replica_extrinsics
+        return replica_intrinsics, torch.linalg.inv(replica_extrinsics)
 
-    def forward(self, images, intrinsics, extrinsics, prompts=None,
-                enable_query_class_logit_lift=True, pre_extracted_features=None,
-                target_extrinsics_cam=None, target_pre_extracted_features=None):
+    def forward(self, images: torch.Tensor, intrinsics: torch.Tensor, extrinsics: torch.Tensor, prompts: Optional[Dict] = None, enable_query_class_logit_lift: bool = True, pre_extracted_features: Optional[Dict] = None, leave_out_view: int | None = None, target_extrinsics_cam: torch.Tensor | None = None, target_pre_extracted_features: Optional[Dict] = None) -> FusedSystemOutput:
         _, _, _, h, w = images.shape
         if self.training:
             torch.cuda.empty_cache()
+        self._log_trainable_parameters_once()
         encoder_frozen = not any(p.requires_grad for p in self.anysplat_encoder.parameters())
-        if self.training and not encoder_frozen:
-            raise RuntimeError(f"Encoder has trainable params but should be fully frozen!")
         ctx = torch.no_grad() if encoder_frozen else torch.enable_grad()
         with ctx:
             encoder_output = self.anysplat_encoder(images, global_step=0, visualization_dump=None)
         gaussians = encoder_output.gaussians
         if self.training:
             torch.cuda.empty_cache()
-        camera_intrinsics, camera_extrinsics = self._resolve_camera_context(
-            encoder_output, intrinsics, extrinsics)
+        camera_intrinsics, camera_extrinsics = self._resolve_camera_context(encoder_output, gaussians, intrinsics, extrinsics)
         if pre_extracted_features is not None:
             sam3_output = self._build_output_from_pre_extracted(pre_extracted_features, images.device)
         elif self.sam3_segmenter is not None:
             sam3_output = self.sam3_segmenter(images, prompts=prompts, feedback_masks=None, iteration=0)
         else:
             raise RuntimeError(
-                "SAM3 not loaded and no pre_extracted_features provided.")
-
+                "SAM3 not loaded and no pre_extracted_features provided. "
+                "Either run scripts/pre_extract_sam3.py first, or set sam3.skip_for_training=false in config."
+            )
         if enable_query_class_logit_lift:
-            gaussians = self._assign_semantics_cross_view(
-                gaussians, sam3_output, camera_intrinsics, camera_extrinsics, h, w)
-            if self.use_vote_head and self.vote_head is not None and gaussians.seg_query_class_logits is not None:
-                per_view = gaussians.seg_per_view_logits  # [B, N, V, Q, C]
-                B2, N2, V2, Q2, C2 = per_view.shape
-                vote_input = per_view.reshape(B2 * N2, V2, Q2, C2)  # [B*N, V, Q, C]
-                vote_input.requires_grad_(True)
-                weights = self.vote_head(vote_input)  # [B*N, Q, V]
-                weights = weights.reshape(B2, N2, Q2, V2)  # [B, N, Q, V]
-                blended = (weights.unsqueeze(-1) * per_view.permute(0, 1, 3, 2, 4)).sum(dim=3)  # [B, N, Q, C]
-                gaussians.seg_query_class_logits = blended
-                del gaussians.seg_per_view_logits, per_view  # free per-view tensor after blending
-
-        rendered_output = self.gaussian_renderer(
-            gaussians, camera_extrinsics, camera_intrinsics, (h, w),
-            render_color=True, render_qc_logits=(not self.training))
+            if self.use_vote_head and self.vote_head is not None:
+                gaussians = self._assign_semantics_cross_view(gaussians, sam3_output, camera_intrinsics, camera_extrinsics, h, w, leave_out_view=leave_out_view)
+                if gaussians.seg_query_class_logits is not None:
+                    per_view = gaussians.seg_per_view_logits  # [B, N, V, Q, C]
+                    weights = self.vote_head(per_view)  # [B, N, V] per-gaussian blending
+                    gaussians.seg_query_class_logits = (weights[:, :, :, None, None] * per_view[..., :-1]).sum(dim=2)  # [B, N, Q, C]
+                    del gaussians.seg_per_view_logits
+            else:
+                gaussians = self._assign_semantics_pixel_aligned(gaussians, sam3_output, h, w)
+                if gaussians.seg_query_class_logits is None:
+                    gaussians = self._assign_semantics_cross_view(gaussians, sam3_output, camera_intrinsics, camera_extrinsics, h, w)
+        rendered_output = self.gaussian_renderer(gaussians, camera_extrinsics, camera_intrinsics, (h, w), render_color=True, render_qc_logits=enable_query_class_logit_lift)
         rendered_output["used_color_fallback"] = rendered_output.get("render_color") is None
         rendered_output["used_depth_fallback"] = rendered_output.get("render_depth") is None
         if rendered_output["used_color_fallback"]:
             rendered_output["render_color"] = images.clone()
         if rendered_output["used_depth_fallback"]:
-            rendered_output["render_depth"] = torch.ones(
-                images.shape[0], images.shape[1], h, w, device=images.device, dtype=images.dtype)
-
+            rendered_output["render_depth"] = torch.ones(images.shape[0], images.shape[1], h, w, device=images.device, dtype=images.dtype)
+        # GNeSF-style target-view rendering: build gaussians from source views, render from target views
         target_rendered = None
         if self.training and target_extrinsics_cam is not None and target_pre_extracted_features is not None:
-            C_s = extrinsics
-            C_t = target_extrinsics_cam.to(images.device)
-            A_s = camera_extrinsics
-            A_t = A_s @ torch.linalg.inv(C_s) @ C_t
-            target_rendered = self.gaussian_renderer(
-                gaussians, A_t, camera_intrinsics, (h, w),
-                render_color=False, render_qc_logits=True)
-
+            C_s = extrinsics  # COLMAP source c2w
+            C_t = target_extrinsics_cam.to(images.device)  # COLMAP target c2w
+            A_s = camera_extrinsics  # AnySplat source c2w
+            A_t = A_s @ torch.linalg.inv(C_s) @ C_t  # target pose in AnySplat frame
+            target_rendered = self.gaussian_renderer(gaussians, A_t, camera_intrinsics, (h, w), render_color=False, render_qc_logits=True)
         return FusedSystemOutput(
             gaussians=gaussians,
             sam3_output=sam3_output,
@@ -240,15 +289,17 @@ class FusedSystem(nn.Module):
             target_rendered_output=target_rendered,
         )
 
-    def _assign_semantics_cross_view(self, gaussians, sam3_output, intrinsics, extrinsics, H, W):
+    def _assign_semantics_cross_view(self, gaussians: Gaussians, sam3_output, intrinsics, extrinsics, H: int, W: int, leave_out_view: int | None = None) -> Gaussians:
         from einops import rearrange
         sam3_qc = getattr(sam3_output, "query_class_logits", None)
         if sam3_qc is None or not isinstance(sam3_qc, torch.Tensor):
             return gaussians
         B, V, Q, C = sam3_qc.shape[:4]
         total_pts = gaussians.means.shape[1]
-        per_view = torch.zeros(B, V, total_pts, Q, C, device=gaussians.means.device, dtype=sam3_qc.dtype)
+        per_view = torch.zeros(B, V, total_pts, Q, C + 1, device=gaussians.means.device, dtype=sam3_qc.dtype)
         for view_idx in range(V):
+            if leave_out_view is not None and view_idx == leave_out_view:
+                continue
             k = intrinsics[:, view_idx].clone()
             e_c2w = extrinsics[:, view_idx]
             e_w2c = torch.linalg.inv(e_c2w)
@@ -257,30 +308,67 @@ class FusedSystem(nn.Module):
             p = torch.matmul(k, torch.cat([e_w2c[:, :3, :3], e_w2c[:, :3, 3:4]], dim=-1))
             means_homo = torch.cat([gaussians.means, torch.ones_like(gaussians.means[..., :1])], dim=-1)
             points_2d = torch.matmul(means_homo, p.transpose(1, 2))
-            z = torch.clamp(points_2d[..., 2:3], min=1e-6)
-            points_2d = points_2d[..., :2] / z
-            coords = torch.stack([
-                2 * points_2d[..., 0] / max(W - 1, 1) - 1,
-                2 * points_2d[..., 1] / max(H - 1, 1) - 1,
-            ], dim=-1)
+            z_before_clamp = points_2d[..., 2:3]
+            z = torch.clamp(z_before_clamp, min=1e-6)
+            xy = points_2d[..., :2] / z  # [B, N, 2]
+            # Visibility gate (GNeSF line 99): gaussian in front of camera + inside image
+            in_image = (xy[..., 0] >= 0) & (xy[..., 0] < W) & (xy[..., 1] >= 0) & (xy[..., 1] < H)  # [B, N]
+            visible = (z_before_clamp.squeeze(-1) > 1e-6) & in_image  # [B, N]
+            coords = torch.stack([2 * xy[..., 0] / max(W-1, 1) - 1, 2 * xy[..., 1] / max(H-1, 1) - 1], dim=-1)
             view_logits = rearrange(sam3_qc[:, view_idx], "b q c h w -> b (q c) h w")
-            sampled = F.grid_sample(view_logits, coords.unsqueeze(2),
-                                    mode="nearest", padding_mode="zeros", align_corners=True).squeeze(-1)
-            per_view[:, view_idx] = rearrange(sampled, "b (q c) n -> b n q c", q=Q, c=C)
-        gaussians.seg_per_view_logits = per_view.permute(0, 2, 1, 3, 4)  # [B, N, V, Q, C]
-        gaussians.seg_query_class_logits = per_view.mean(dim=1)  # [B, N, Q, C], used by renderer
+            sampled = F.grid_sample(view_logits, coords.unsqueeze(2), mode="nearest", padding_mode="zeros", align_corners=True).squeeze(-1)
+            per_view[:, view_idx, :, :, :C] = rearrange(sampled, "b (q c) n -> b n q c", q=Q, c=C)
+            per_view[:, view_idx, :, :, C] = visible.float().unsqueeze(-1).expand(-1, -1, Q)  # [B, N, Q]
+        gaussians.seg_per_view_logits = per_view.permute(0, 2, 1, 3, 4)  # [B, N, V, Q, C+1]
+        gaussians.seg_query_class_logits = per_view[:, :, :, :, :C].mean(dim=1)  # [B, N, Q, C]
         return gaussians
 
-    def _build_output_from_pre_extracted(self, pre_data, device):
+    def _assign_semantics_pixel_aligned(self, gaussians: Gaussians, sam3_output, H: int, W: int, voxel_inv_indices=None) -> Gaussians:
+        from einops import rearrange
+        sam3_qc = getattr(sam3_output, "query_class_logits", None)
+        if sam3_qc is None or not isinstance(sam3_qc, torch.Tensor):
+            return gaussians
+        B, V, Q, C = sam3_qc.shape[:4]
+        total_pts = gaussians.means.shape[1]
+        hw_per_view = H * W
+        if total_pts == V * hw_per_view:
+            gaussians.seg_query_class_logits = rearrange(sam3_qc, "b v q c h w -> b (v h w) q c")
+        elif voxel_inv_indices is not None:
+            gaussians.seg_query_class_logits = torch.zeros(B, total_pts, Q, C, device=gaussians.means.device, dtype=sam3_qc.dtype)
+            offset = 0
+            for b in range(B):
+                inv_idx_flat = voxel_inv_indices[b]  # [V*H*W]
+                num_total_voxels = int(inv_idx_flat.max().item()) + 1
+                sam3_qc_b = rearrange(sam3_qc[b], "v q c h w -> v (h w) q c")
+                sam3_qc_flat = rearrange(sam3_qc_b, "v n q c -> (v n) q c")
+                aggregated = torch.zeros(num_total_voxels, Q, C, device=sam3_qc_flat.device, dtype=sam3_qc_flat.dtype)
+                inv_idx_exp = inv_idx_flat.view(-1, 1, 1).expand(-1, Q, C)
+                aggregated = aggregated.scatter_reduce(0, inv_idx_exp, sam3_qc_flat, reduce="mean", include_self=False)
+                gaussians.seg_query_class_logits[b, :num_total_voxels] = aggregated
+                offset += num_total_voxels
+            if not getattr(self, "_warned_voxel_assign", False):
+                print(f"[FusedSystem] voxelized semantic assignment: original_pts={V*hw_per_view}, voxelized_pts={total_pts}")
+                self._warned_voxel_assign = True
+        seg_masks = getattr(sam3_output, "seg_masks", None)
+        if isinstance(seg_masks, torch.Tensor) and seg_masks.numel() > 0:
+            flat_masks = rearrange(seg_masks, "b v q h w -> b (v h w) q")
+            if Q > 1:
+                max_vals, max_idx = flat_masks.max(dim=-1)
+                gaussians.instance_labels = max_idx.long()
+                gaussians.semantic_labels = (max_vals > 0.5).long()
+            else:
+                gaussians.instance_labels = (flat_masks.squeeze(-1) > 0.5).long()
+                gaussians.semantic_labels = (flat_masks.squeeze(-1) > 0.5).long()
+        return gaussians
+
+    def _build_output_from_pre_extracted(self, pre_data: Dict, device: torch.device) -> SAM3SegmenterOutput:
         qc = pre_data["query_class_logits"].to(device)
         V = qc.shape[1]
         masks = pre_data.get("seg_masks")
         scores = pre_data.get("query_scores")
         return SAM3SegmenterOutput(
-            seg_masks=masks.to(device) if masks is not None else torch.zeros(
-                1, V, qc.shape[2], *qc.shape[-2:], device=device),
+            seg_masks=masks.to(device) if masks is not None else torch.zeros(1, V, qc.shape[2], *qc.shape[-2:], device=device),
             seg_logits=qc[:, :, :, 1:2] if qc.dim() >= 4 else qc,
             query_class_logits=qc,
-            query_scores=scores.to(device) if scores is not None else torch.ones(
-                1, V, qc.shape[2], device=device),
+            query_scores=scores.to(device) if scores is not None else torch.ones(1, V, qc.shape[2], device=device),
         )

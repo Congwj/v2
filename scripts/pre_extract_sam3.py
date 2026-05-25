@@ -21,24 +21,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/fused_system_v2.yaml")
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--split", type=str, default=None)
     args = parser.parse_args()
 
     config = load_config(args.config)
     data_cfg = config.get("data", {})
     sam3_cfg = config["model"].get("sam3", {})
 
-    dataset = SIU3RDataset(
-        resolve_project_path(data_cfg.get("dataset_root")),
-        split=args.split or data_cfg.get("split", "train"),
-        num_views=int(data_cfg.get("num_views", 3)),
-        img_size=config["model"].get("image_size", [518, 518])[0]
-        if isinstance(config["model"].get("image_size"), list)
-        else config["model"].get("image_size", 518),
-        frame_stride=int(data_cfg.get("frame_stride", 1)),
-        max_samples=args.max_samples or data_cfg.get("max_train_samples"),
-    )
+    max_train = data_cfg.get("max_train_samples")
+    max_val = data_cfg.get("max_val_samples")
+    data_root = resolve_project_path(data_cfg.get("dataset_root"))
+    img_sz = config["model"].get("image_size", [518, 518])
+    img_size = img_sz[0] if isinstance(img_sz, list) else img_sz
+    n_views = int(data_cfg.get("num_views", 3))
+    f_stride = int(data_cfg.get("frame_stride", 1))
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     segmenter = SAM3Segmenter(
@@ -53,36 +48,38 @@ def main():
 
     pre_extract_dir = resolve_project_path(data_cfg.get("pre_extract_dir", "data/pre_extracted"))
     Path(pre_extract_dir).mkdir(parents=True, exist_ok=True)
-    print(f"[PreExtract] saving features to {pre_extract_dir}, samples={len(dataset)}")
 
-    for idx in tqdm(range(len(dataset)), desc="Pre-extracting SAM3"):
-        sample = dataset[idx]
-        scene_id = sample.get("scene_id", f"sample_{idx}")
+    splits = [("train", max_train), ("val", max_val)]
+    for split_name, max_samples in splits:
+        if max_samples is not None and max_samples <= 0:
+            continue
+        dataset = SIU3RDataset(data_root, split=split_name, num_views=n_views, img_size=img_size,
+                               frame_stride=f_stride, max_samples=max_samples)
+        print(f"[PreExtract] split={split_name}, samples={len(dataset)}, saving to {pre_extract_dir}")
 
-        def _extract_view(images, prompt, start_idx_val):
-            sample_key = f"{scene_id}_{start_idx_val}"
-            out_path = Path(pre_extract_dir) / f"{sample_key}_sam3_qc.pt"
-            if out_path.exists():
-                return
-            img_batch = images.unsqueeze(0).to(device) if images.dim() == 4 else images.to(device)
-            with torch.no_grad():
-                sam3_out = segmenter(img_batch, prompts=prompt, feedback_masks=None, iteration=0)
-            torch.save(
-                {
-                    "query_class_logits": sam3_out.query_class_logits.cpu(),
-                    "seg_masks": sam3_out.seg_masks.cpu(),
-                    "query_scores": sam3_out.query_scores.cpu() if sam3_out.query_scores is not None else None,
-                },
-                str(out_path),
-            )
+        for idx in tqdm(range(len(dataset)), desc=f"Pre-extracting SAM3 {split_name}"):
+            sample = dataset[idx]
+            scene_id = sample.get("scene_id", f"sample_{idx}")
 
-        # Source views
-        _extract_view(sample["images"], sample.get("prompts"), sample.get("start_idx", idx))
-        # Target views
-        target_images = sample.get("target_images")
-        target_start = sample.get("target_start_idx")
-        if isinstance(target_images, torch.Tensor) and target_images.numel() > 0 and target_start is not None:
-            _extract_view(target_images, sample.get("prompts"), target_start)
+            def _extract_view(images, prompt, start_idx_val):
+                sample_key = f"{scene_id}_{start_idx_val}"
+                out_path = Path(pre_extract_dir) / f"{sample_key}_sam3_qc.pt"
+                if out_path.exists():
+                    return
+                img_batch = images.unsqueeze(0).to(device) if images.dim() == 4 else images.to(device)
+                with torch.no_grad():
+                    sam3_out = segmenter(img_batch, prompts=prompt, feedback_masks=None, iteration=0)
+                torch.save(
+                    {"query_class_logits": sam3_out.query_class_logits.cpu(),
+                     "seg_masks": sam3_out.seg_masks.cpu(),
+                     "query_scores": sam3_out.query_scores.cpu() if sam3_out.query_scores is not None else None},
+                    str(out_path))
+
+            _extract_view(sample["images"], sample.get("prompts"), sample.get("start_idx", idx))
+            target_images = sample.get("target_images")
+            target_start = sample.get("target_start_idx")
+            if isinstance(target_images, torch.Tensor) and target_images.numel() > 0 and target_start is not None:
+                _extract_view(target_images, sample.get("prompts"), target_start)
 
     print(f"[PreExtract] done. Features saved to {pre_extract_dir}")
 

@@ -16,11 +16,18 @@ def build_segmenter(config: dict, device: torch.device) -> SAM3Segmenter:
     segmenter = SAM3Segmenter(
         num_classes=sam3_config.get("num_classes", 1),
         num_queries=sam3_config.get("num_queries", 24),
+        use_sam3_api=bool(sam3_config.get("checkpoint")),
         sam3_checkpoint=resolve_project_path(sam3_config.get("checkpoint", "src/pretrained_weights/sam3.pt")),
         freeze_sam3=sam3_config.get("freeze_sam3", True),
         freeze_sam3_backbone=sam3_config.get("freeze_sam3_backbone", True),
         train_sam3_decoder=sam3_config.get("train_sam3_decoder", False),
     )
+    print(f"[Inference] SAM3 status: {segmenter.runtime_status}")
+    if segmenter.runtime_status.get("using_simple_segmenter"):
+        raise RuntimeError(
+            "SAM3 was not loaded; refusing to export fake segmentation from the fallback simple segmenter. "
+            f"status={segmenter.runtime_status}"
+        )
     return segmenter.to(device).eval()
 
 
@@ -41,36 +48,40 @@ def load_fused_checkpoint(model: FusedSystem, ckpt_path: str, device: torch.devi
         elif not key.startswith(("mse_loss", "psnr", "ssim", "lpips", "fused_loss")):
             fused_state[key] = value
     missing, unexpected = model.load_state_dict(fused_state, strict=False)
-    vote_head_missing = [k for k in missing if "vote_head" in k]
-    if vote_head_missing:
-        raise RuntimeError(
-            f"VoteHead weights not loaded from checkpoint — architecture mismatch. "
-            f"Re-train with the current code. Missing keys: {vote_head_missing}"
-        )
     print(
         f"[Inference] Loaded checkpoint: {resolved_ckpt}; "
         f"missing_keys={len(missing)}, unexpected_keys={len(unexpected)}"
     )
+    if missing:
+        print(f"[Inference] missing_keys sample: {missing[:20]}")
+    if unexpected:
+        print(f"[Inference] unexpected_keys sample: {unexpected[:20]}")
 
 
-def build_model(config: dict, device: torch.device, ckpt_path: str = None) -> FusedSystem:
+def build_model(config: dict, device: torch.device, anysplat_pred_head_type: str = "point", ckpt_path: str = None) -> FusedSystem:
     model_config = config["model"]
     sam3_config = model_config.get("sam3", {})
     backbone_config = model_config.get("backbone", {})
     gaussian_config = model_config.get("gaussian_adapter", {})
+    print(
+        f"[Inference] Building model on device={device} with sam3_checkpoint={sam3_config.get('checkpoint')}, "
+        f"anysplat_pred_head_type={anysplat_pred_head_type}"
+    )
     image_size = model_config.get("image_size", 518)
     img_size = image_size[0] if isinstance(image_size, list) else image_size
     model = FusedSystem(
+        sam3_model=None,
         img_size=img_size,
         num_classes=sam3_config.get("num_classes", 1),
         num_queries=sam3_config.get("num_queries", 24),
         use_sam3_api=bool(sam3_config.get("checkpoint")),
         sam3_checkpoint=resolve_project_path(sam3_config.get("checkpoint", "src/pretrained_weights/sam3.pt")),
+        use_anysplat_pretrained=bool(backbone_config.get("checkpoint")),
         anysplat_checkpoint=resolve_project_path(backbone_config.get("checkpoint")),
         freeze_sam3=sam3_config.get("freeze_sam3", True),
         freeze_sam3_backbone=sam3_config.get("freeze_sam3_backbone", True),
         train_sam3_decoder=sam3_config.get("train_sam3_decoder", False),
-        freeze_gaussian_head=backbone_config.get("freeze_gaussian_head", True),
+        freeze_gaussian_head=backbone_config.get("freeze_gaussian_head", False),
         freeze_backbone=backbone_config.get("freeze_encoder", True),
         feature_dim=backbone_config.get("feature_dim", 2048),
         sh_degree=gaussian_config.get("sh_degree", 2),
@@ -80,7 +91,11 @@ def build_model(config: dict, device: torch.device, ckpt_path: str = None) -> Fu
         voxel_size=float(gaussian_config.get("voxel_size", 0.02)),
         voxelize=False,
         use_vote_head=True,
+        anysplat_pred_head_type=anysplat_pred_head_type,
+        use_replica_camera_context=True,
     )
+    seg_status = getattr(model.sam3_segmenter, "runtime_status", {})
+    print(f"[Inference] SAM3 status: {seg_status}")
     load_fused_checkpoint(model, ckpt_path, device)
     return model.to(device).eval()
 
@@ -186,6 +201,29 @@ def run_inference(model, dataset, output_dir, device, num_samples=3):
         with torch.no_grad():
             output = model(images, intrinsics, extrinsics, prompts=prompts, enable_query_class_logit_lift=True)
         export_all_outputs(output, output_dir, prefix=f"sample_{idx:03d}", batch_idx=0)
+        # Test: render from target views to check VoteHead effect
+        target_ext = batch.get("target_extrinsics")
+        if target_ext is None:
+            print(f"[Inference] sample_{idx}: no target_extrinsics — skipping target-view render")
+        elif output.backbone_output is None:
+            print(f"[Inference] sample_{idx}: no backbone_output — skipping target-view render")
+        else:
+            pred_pose = getattr(output.backbone_output, "pred_context_pose", None)
+            if not isinstance(pred_pose, dict):
+                print(f"[Inference] sample_{idx}: no pred_context_pose — skipping target-view render")
+            else:
+                A_s = torch.linalg.inv(pred_pose["extrinsic"])  # w2c → c2w
+                A_t = A_s @ torch.linalg.inv(extrinsics) @ target_ext.to(device)
+                H, W = images.shape[-2], images.shape[-1]
+                target_rendered = model.gaussian_renderer(
+                    output.gaussians, A_t, pred_pose["intrinsic"], (H, W),
+                    render_color=False, render_qc_logits=True)
+                if target_rendered.get("render_qc_logits") is not None:
+                    export_render_qc_logits(target_rendered["render_qc_logits"],
+                        output_dir / f"sample_{idx:03d}_render_semantic_target.png", 0)
+                    export_render_qc_foreground_heatmap(target_rendered["render_qc_logits"],
+                        output_dir / f"sample_{idx:03d}_render_semantic_target_fg_prob.png", 0)
+                    print(f"[Inference] Exported target-view semantic for sample_{idx:03d}")
         print(f"[Inference] Exported sample_{idx:03d} to {output_dir}")
 
 
@@ -205,7 +243,7 @@ def main():
     config = load_config(args.config)
     dataset = get_dataset(config, refer_pair=args.refer_pair, prompt_mode=args.prompt_mode)
     if args.depth_only:
-        model = build_model(config, device, ckpt_path=args.ckpt)
+        model = build_model(config, device, anysplat_pred_head_type="depth", ckpt_path=args.ckpt)
         run_depth_inference(model, dataset, resolve_project_path(args.output), device, args.num_samples)
         return
     if not args.full_fusion:

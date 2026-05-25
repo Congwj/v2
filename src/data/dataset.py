@@ -526,8 +526,11 @@ class SIU3RDataset(MultiViewDataset):
 
         raw = np.load(path) if path.endswith(".npy") else np.loadtxt(path)
         try:
-            return _to_intrinsic_tensor(raw)
-        except Exception:
+            parsed = _to_intrinsic_tensor(raw)
+            print(f"[SIU3RDataset] loaded intrinsics from {path} with raw_shape={np.asarray(raw).shape} -> parsed_shape={tuple(parsed.shape)}")
+            return parsed
+        except Exception as exc:
+            print(f"[SIU3RDataset] failed to parse intrinsics from {path} with raw_shape={np.asarray(raw).shape}: {exc}; using identity intrinsics fallback.")
             return torch.eye(3)
 
     def _load_extrinsics_from_path(self, path: str) -> torch.Tensor:

@@ -14,10 +14,7 @@ class SplattingCUDA(nn.Module):
         self.scale_factor = 1 / self.near
         self.register_buffer("background_color", torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32), persistent=False)
 
-    def forward(self, gaussians: Gaussians, extrinsics: torch.Tensor, intrinsics: torch.Tensor,
-                image_shape: tuple[int, int], render_color: bool = True, render_feature: bool = False,
-                render_id: bool = False, render_qc_logits: bool = False,
-                cam_rot_delta: torch.Tensor | None = None, cam_trans_delta: torch.Tensor | None = None):
+    def forward(self, gaussians: Gaussians, extrinsics: torch.Tensor, intrinsics: torch.Tensor, image_shape: tuple[int, int], render_color: bool = True, render_feature: bool = False, render_id: bool = False, render_qc_logits: bool = False, cam_rot_delta: torch.Tensor | None = None, cam_trans_delta: torch.Tensor | None = None):
         b, v, _, _ = extrinsics.shape
         near = torch.full((b * v,), 1e-10, dtype=torch.float32, device=extrinsics.device)
         far = torch.full((b * v,), self.far, dtype=torch.float32, device=extrinsics.device)
@@ -26,7 +23,9 @@ class SplattingCUDA(nn.Module):
             color, depth = render_cuda(
                 rearrange(extrinsics, "b v i j -> (b v) i j").float(),
                 rearrange(intrinsics, "b v i j -> (b v) i j").float(),
-                near, far, image_shape,
+                near,
+                far,
+                image_shape,
                 repeat(self.background_color, "c -> (b v) c", b=b, v=v),
                 repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v).float(),
                 repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v).float(),
@@ -44,29 +43,31 @@ class SplattingCUDA(nn.Module):
             all_query_class_logits = []
             seg_query_class_logits = gaussians.seg_query_class_logits
             if seg_query_class_logits is not None:
+                print(f"[gsplat QC] seg_qc shape={seg_query_class_logits.shape}, min={seg_query_class_logits.min().item():.4f}, max={seg_query_class_logits.max().item():.4f}, mean={seg_query_class_logits.mean().item():.4f}")
                 try:
                     from gsplat import rasterization
                 except Exception:
                     rasterization = None
+                print(f"[gsplat QC] rasterization_available={rasterization is not None}")
                 for i in range(b):
+                    means_i = gaussians.means[i]
+                    covariances_i = gaussians.covariances[i]
+                    opacities_i = gaussians.opacities[i]
+                    ks = intrinsics[i].clone()
+                    ks[:, 0, :] *= width
+                    ks[:, 1, :] *= height
+                    viewmats = extrinsics[i].inverse()
                     query_class_logits = seg_query_class_logits[i]
                     if rasterization is not None and query_class_logits is not None and query_class_logits.dim() == 3:
                         _, q, c = query_class_logits.shape
                         flat_logits = rearrange(query_class_logits, "n q c -> n (q c)")
-                        ks = intrinsics[i].clone()
-                        ks[:, 0, :] *= width
-                        ks[:, 1, :] *= height
-                        rendered_qc_logits, _, _ = rasterization(
-                            means=gaussians.means[i].float(), quats=None, scales=None,
-                            covars=gaussians.covariances[i].float(),
-                            opacities=gaussians.opacities[i].float(),
-                            colors=flat_logits.float(),
-                            viewmats=extrinsics[i].inverse().float(),
-                            Ks=ks.float(), width=width, height=height,
-                            sh_degree=None, near_plane=1e-10, far_plane=self.far)
-                        all_query_class_logits.append(
-                            rearrange(rendered_qc_logits, "n h w (q c) -> n q c h w", q=q, c=c))
+                        rendered_qc_logits, _, _ = rasterization(means=means_i.float(), quats=None, scales=None, covars=covariances_i.float(), opacities=opacities_i.float(), colors=flat_logits.float(), viewmats=viewmats.float(), Ks=ks.float(), width=width, height=height, sh_degree=None, near_plane=1e-10, far_plane=self.far)
+                        all_query_class_logits.append(rearrange(rendered_qc_logits, "n h w (q c) -> n q c h w", q=q, c=c))
                     else:
                         all_query_class_logits.append(None)
             result["render_qc_logits"] = all_query_class_logits
+        if render_feature:
+            raise NotImplementedError("Feature rendering not implemented")
+        if render_id:
+            raise NotImplementedError("ID rendering not implemented")
         return result
