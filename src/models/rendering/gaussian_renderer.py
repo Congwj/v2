@@ -43,12 +43,10 @@ class SplattingCUDA(nn.Module):
             all_query_class_logits = []
             seg_query_class_logits = gaussians.seg_query_class_logits
             if seg_query_class_logits is not None:
-                print(f"[gsplat QC] seg_qc shape={seg_query_class_logits.shape}, min={seg_query_class_logits.min().item():.4f}, max={seg_query_class_logits.max().item():.4f}, mean={seg_query_class_logits.mean().item():.4f}")
                 try:
                     from gsplat import rasterization
                 except Exception:
                     rasterization = None
-                print(f"[gsplat QC] rasterization_available={rasterization is not None}")
                 for i in range(b):
                     means_i = gaussians.means[i]
                     covariances_i = gaussians.covariances[i]
@@ -58,11 +56,17 @@ class SplattingCUDA(nn.Module):
                     ks[:, 1, :] *= height
                     viewmats = extrinsics[i].inverse()
                     query_class_logits = seg_query_class_logits[i]
-                    if rasterization is not None and query_class_logits is not None and query_class_logits.dim() == 3:
-                        _, q, c = query_class_logits.shape
-                        flat_logits = rearrange(query_class_logits, "n q c -> n (q c)")
-                        rendered_qc_logits, _, _ = rasterization(means=means_i.float(), quats=None, scales=None, covars=covariances_i.float(), opacities=opacities_i.float(), colors=flat_logits.float(), viewmats=viewmats.float(), Ks=ks.float(), width=width, height=height, sh_degree=None, near_plane=1e-10, far_plane=self.far)
-                        all_query_class_logits.append(rearrange(rendered_qc_logits, "n h w (q c) -> n q c h w", q=q, c=c))
+                    if rasterization is not None and query_class_logits is not None and query_class_logits.dim() >= 2:
+                        c = query_class_logits.shape[-1]
+                        # [N, C] → use directly; [N, Q, C] → flatten Q
+                        flat_logits = query_class_logits if query_class_logits.dim() == 2 else rearrange(query_class_logits, "n q c -> n (q c)")
+                        rendered_qc_logits, _, _ = rasterization(
+                            means=means_i.float(), quats=None, scales=None,
+                            covars=covariances_i.float(), opacities=opacities_i.float(),
+                            colors=flat_logits.float(), viewmats=viewmats.float(),
+                            Ks=ks.float(), width=width, height=height,
+                            sh_degree=None, near_plane=1e-10, far_plane=self.far)
+                        all_query_class_logits.append(rearrange(rendered_qc_logits, "n h w c -> n 1 c h w"))
                     else:
                         all_query_class_logits.append(None)
             result["render_qc_logits"] = all_query_class_logits

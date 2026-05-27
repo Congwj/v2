@@ -7,7 +7,16 @@
       "Read(//mnt/d/code/paper/**)",
       "Bash(\"D:\\\\code\\\\paper\\\\siu_pro_v2\\\\src\\\\data\\\\SIU3R_DATASET\"\\\\val_refer_seg_data.json *)",
       "Bash(pip install *我在服务器配的环境)",
-      "Bash(pip install * 服务器下载的)"
+      "Bash(pip install * 服务器下载的)",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "WebFetch(domain:arxiv.org)",
+      "WebSearch",
+      "WebFetch(domain:gchhablani.github.io)",
+      "WebFetch(domain:www.catalyzex.com)",
+      "WebFetch(domain:www.chatpaper.ai)"
     ]
   }
 }

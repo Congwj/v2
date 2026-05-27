@@ -22,71 +22,82 @@ class FusedSystemOutput:
 
 
 class VoteHead(nn.Module):
-    """GNeSF GeneralRenderingNetwork adapted for Gaussian splatting.
-    Per-gaussian (not per-query): all Q queries share V blending weights.
-    base_fc → vis_fc → vis_fc2 → sem_fc → softmax over V.
-    Reference: GNeSF-3D/models/mlp_network.py GeneralRenderingNetwork."""
-    def __init__(self, num_classes=1, hidden_dim=32):
+    """Exact GNeSF GeneralRenderingNetwork adapted for Gaussian splatting.
+    base_fc -> vis_fc -> vis_fc2 -> sem_fc, with masked_fill before softmax.
+    Reference: GNeSF-3D/models/mlp_network.py GeneralRenderingNetwork (lines 26-145)."""
+    def __init__(self, num_classes=1):
         super().__init__()
-        C = num_classes + 1
-        H = hidden_dim
-        # base_fc: [x(C), mean(2C), vis(1)] → 3C+1 (GNeSF line 50-54, +visibility gate)
+        C = num_classes + 1  # 2
+        # base_fc: GNeSF line 50-54: Linear(in,64)->ELU->Linear(64,32)->ELU
         self.base_fc = nn.Sequential(
-            nn.Linear(C * 3 + 1, H * 2), nn.ELU(),
-            nn.Linear(H * 2, H), nn.ELU(),
+            nn.Linear(C * 3, 64), nn.ELU(),
+            nn.Linear(64, 32), nn.ELU(),
         )
-        # vis_fc: residual + visibility (GNeSF line 56-60)
+        # vis_fc: GNeSF line 56-60: Linear(32,32)->ELU->Linear(32,33)->ELU
         self.vis_fc = nn.Sequential(
-            nn.Linear(H, H), nn.ELU(),
-            nn.Linear(H, H + 1), nn.ELU(),
+            nn.Linear(32, 32), nn.ELU(),
+            nn.Linear(32, 33), nn.ELU(),
         )
-        # vis_fc2: refined visibility (GNeSF line 62-66)
+        # vis_fc2: GNeSF line 62-66: Linear(32,32)->ELU->Linear(32,1)->Sigmoid
         self.vis_fc2 = nn.Sequential(
-            nn.Linear(H, H), nn.ELU(),
-            nn.Linear(H, 1), nn.Sigmoid(),
+            nn.Linear(32, 32), nn.ELU(),
+            nn.Linear(32, 1), nn.Sigmoid(),
         )
-        # sem_fc: [features, visibility] → blend logit (GNeSF line 75-79)
+        # sem_fc: GNeSF line 75-79: Linear(33,16)->ELU->Linear(16,8)->ELU->Linear(8,1)
         self.sem_fc = nn.Sequential(
-            nn.Linear(H + 1, H // 2), nn.ELU(),
-            nn.Linear(H // 2, H // 4), nn.ELU(),
-            nn.Linear(H // 4, 1),
+            nn.Linear(33, 16), nn.ELU(),
+            nn.Linear(16, 8), nn.ELU(),
+            nn.Linear(8, 1),
         )
-        # GNeSF weights_init: all Linear layers kaiming_normal + zero bias (GNeSF line 12-16)
-        for module in [self.base_fc, self.vis_fc, self.vis_fc2, self.sem_fc]:
-            for m in module:
-                if isinstance(m, nn.Linear):
-                    nn.init.kaiming_normal_(m.weight)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-        # Override sem_fc last layer to zero: untrained → uniform blending
-        nn.init.zeros_(self.sem_fc[-1].weight)
-        nn.init.zeros_(self.sem_fc[-1].bias)
+        # GNeSF: only sem_fc gets weights_init (GNeSF line 80)
+        self.sem_fc.apply(self._weights_init)
+
+    @staticmethod
+    def _weights_init(m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight.data)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias.data)
 
     def forward(self, per_view_logits):
-        # per_view_logits: [B, N, V, Q, C+1] where C+1 = [logits(C), visibility(1)]
-        B, N, V, Q, Cp1 = per_view_logits.shape
-        C = Cp1 - 1  # visibility is the last channel
-        x = per_view_logits.permute(0, 1, 3, 2, 4).reshape(B * N * Q, V, Cp1)  # [B*N*Q, V, C+1]
-        x_raw = x[..., :C]  # [B*N*Q, V, C] — SAM3 logits
-        vis = x[..., C:]    # [B*N*Q, V, 1] — visibility gate
-        mean = x_raw.mean(dim=1, keepdim=True)  # [B*N*Q, 1, C]
-        var = ((x_raw - mean) ** 2).mean(dim=1, keepdim=True)  # [B*N*Q, 1, C]
-        globalfeat = torch.cat([mean, var], dim=-1).expand(-1, V, -1)  # [B*N*Q, V, 2*C]
-        # base_fc: [globalfeat(2C), raw_logits(C), visibility(1)] (GNeSF + visibility gate)
-        x = self.base_fc(torch.cat([globalfeat, x_raw, vis], dim=-1))  # [B*N*Q, V, H]
-        # vis_fc: residual + visibility (GNeSF line 125-127)
-        x_vis = self.vis_fc(x)  # [B*N*Q, V, H+1]
-        x_res, vis = torch.split(x_vis, [x_vis.shape[-1] - 1, 1], dim=-1)
-        vis = torch.sigmoid(vis)
+        # per_view_logits: [B, N, V, C+1] where C+1=[logits(C), visibility(1)]
+        # Exact GNeSF GeneralRenderingNetwork structure: no Q dimension.
+        B, N, V, Cp1 = per_view_logits.shape
+        C = Cp1 - 1
+        x_raw = per_view_logits[..., :C]             # [B, N, V, C]
+        vis_mask = per_view_logits[..., C:]           # [B, N, V, 1]
+
+        # Flatten: [B*N, V, C]
+        x_raw_flat = x_raw.reshape(B * N, V, C)
+        vis_flat = vis_mask.reshape(B * N, V, 1)
+
+        # GNeSF eq: anti-alias weight from visibility mask
+        weight = vis_flat / (vis_flat.sum(dim=1, keepdim=True) + 1e-8)
+
+        # GNeSF eq: fused mean and variance across views
+        mean = (x_raw_flat * weight).sum(dim=1, keepdim=True)
+        var = (weight * (x_raw_flat - mean) ** 2).sum(dim=1, keepdim=True)
+        globalfeat = torch.cat([mean, var], dim=-1)  # [BN, 1, 2C]
+
+        # GNeSF eq: base_fc input = [globalfeat, per-view features]
+        x = torch.cat([globalfeat.expand(-1, V, -1), x_raw_flat], dim=-1)  # [BN, V, 3C]
+        x = self.base_fc(x)  # [BN, V, 32]
+
+        # GNeSF eq: vis_fc → residual + visibility
+        x_vis = self.vis_fc(x * weight)  # [BN, V, 33]
+        x_res, vis = torch.split(x_vis, [32, 1], dim=-1)
+        vis = torch.sigmoid(vis) * vis_flat
         x = x + x_res
-        # vis_fc2: refined visibility (GNeSF line 129)
-        vis = self.vis_fc2(x * vis)
-        # sem_fc: [features, visibility] → per-view blend logit (GNeSF line 132-142)
-        sem_input = torch.cat([x, vis], dim=-1)
-        blend_logits = self.sem_fc(sem_input).squeeze(-1)  # [B*N*Q, V]
-        weights = F.softmax(blend_logits, dim=-1)  # [B*N*Q, V]
-        # Average weights across Q (all queries share the same blending for this gaussian)
-        weights = weights.reshape(B, N, Q, V).mean(dim=2)  # [B, N, V]
+
+        # GNeSF eq: vis_fc2
+        vis = self.vis_fc2(x * vis) * vis_flat
+
+        # GNeSF eq: sem_fc → masked_fill → softmax → per-view blending weight
+        sem_input = torch.cat([x, vis], dim=-1)  # [BN, V, 33]
+        blend_logits = self.sem_fc(sem_input).squeeze(-1)  # [BN, V]
+        blend_logits = blend_logits.masked_fill(vis_flat.squeeze(-1) == 0, -6e4)
+        weights = F.softmax(blend_logits, dim=-1)  # [BN, V]
+        weights = weights.reshape(B, N, V)  # [B, N, V]
         return weights
 
 
@@ -230,7 +241,7 @@ class FusedSystem(nn.Module):
         replica_extrinsics = pred_context_pose.get("extrinsic")
         if not isinstance(replica_intrinsics, torch.Tensor) or not isinstance(replica_extrinsics, torch.Tensor):
             return intrinsics, extrinsics
-        return replica_intrinsics, torch.linalg.inv(replica_extrinsics)
+        return replica_intrinsics, replica_extrinsics
 
     def forward(self, images: torch.Tensor, intrinsics: torch.Tensor, extrinsics: torch.Tensor, prompts: Optional[Dict] = None, enable_query_class_logit_lift: bool = True, pre_extracted_features: Optional[Dict] = None, leave_out_view: int | None = None, target_extrinsics_cam: torch.Tensor | None = None, target_pre_extracted_features: Optional[Dict] = None) -> FusedSystemOutput:
         _, _, _, h, w = images.shape
@@ -258,9 +269,9 @@ class FusedSystem(nn.Module):
             if self.use_vote_head and self.vote_head is not None:
                 gaussians = self._assign_semantics_cross_view(gaussians, sam3_output, camera_intrinsics, camera_extrinsics, h, w, leave_out_view=leave_out_view)
                 if gaussians.seg_query_class_logits is not None:
-                    per_view = gaussians.seg_per_view_logits  # [B, N, V, Q, C]
-                    weights = self.vote_head(per_view)  # [B, N, V] per-gaussian blending
-                    gaussians.seg_query_class_logits = (weights[:, :, :, None, None] * per_view[..., :-1]).sum(dim=2)  # [B, N, Q, C]
+                    per_view = gaussians.seg_per_view_logits  # [B, N, V, C+1]
+                    weights = self.vote_head(per_view)  # [B, N, V]
+                    gaussians.seg_query_class_logits = (weights[:, :, :, None] * per_view[..., :-1]).sum(dim=2)  # [B, N, C]
                     del gaussians.seg_per_view_logits
             else:
                 gaussians = self._assign_semantics_pixel_aligned(gaussians, sam3_output, h, w)
@@ -295,8 +306,19 @@ class FusedSystem(nn.Module):
         if sam3_qc is None or not isinstance(sam3_qc, torch.Tensor):
             return gaussians
         B, V, Q, C = sam3_qc.shape[:4]
+
+        # ---------- GNeSF-aligned: aggregate Q → 1 BEFORE projection ----------
+        # Per pixel, pick the query with highest fg score, use its full [bg, fg].
+        # This converts SAM3 [B, V, Q, C, H, W] → per-view [B, V, C, H, W],
+        # matching GNeSF's 2D segmenter output format (no Q dimension).
+        sam3_fg = sam3_qc[..., 1, :, :]                       # [B, V, Q, H, W]
+        best_q = sam3_fg.argmax(dim=2)                         # [B, V, H, W]
+        sam3_per_view = sam3_qc.gather(                        # [B, V, C, H, W]
+            dim=2, index=best_q.unsqueeze(2).unsqueeze(3).expand(B, V, 1, C, H, W)
+        ).squeeze(2)
+
         total_pts = gaussians.means.shape[1]
-        per_view = torch.zeros(B, V, total_pts, Q, C + 1, device=gaussians.means.device, dtype=sam3_qc.dtype)
+        per_view = torch.zeros(B, V, total_pts, C + 1, device=gaussians.means.device, dtype=sam3_qc.dtype)
         for view_idx in range(V):
             if leave_out_view is not None and view_idx == leave_out_view:
                 continue
@@ -311,16 +333,19 @@ class FusedSystem(nn.Module):
             z_before_clamp = points_2d[..., 2:3]
             z = torch.clamp(z_before_clamp, min=1e-6)
             xy = points_2d[..., :2] / z  # [B, N, 2]
-            # Visibility gate (GNeSF line 99): gaussian in front of camera + inside image
             in_image = (xy[..., 0] >= 0) & (xy[..., 0] < W) & (xy[..., 1] >= 0) & (xy[..., 1] < H)  # [B, N]
             visible = (z_before_clamp.squeeze(-1) > 1e-6) & in_image  # [B, N]
-            coords = torch.stack([2 * xy[..., 0] / max(W-1, 1) - 1, 2 * xy[..., 1] / max(H-1, 1) - 1], dim=-1)
-            view_logits = rearrange(sam3_qc[:, view_idx], "b q c h w -> b (q c) h w")
-            sampled = F.grid_sample(view_logits, coords.unsqueeze(2), mode="nearest", padding_mode="zeros", align_corners=True).squeeze(-1)
-            per_view[:, view_idx, :, :, :C] = rearrange(sampled, "b (q c) n -> b n q c", q=Q, c=C)
-            per_view[:, view_idx, :, :, C] = visible.float().unsqueeze(-1).expand(-1, -1, Q)  # [B, N, Q]
-        gaussians.seg_per_view_logits = per_view.permute(0, 2, 1, 3, 4)  # [B, N, V, Q, C+1]
-        gaussians.seg_query_class_logits = per_view[:, :, :, :, :C].mean(dim=1)  # [B, N, Q, C]
+            coords = torch.stack([2 * xy[..., 0] / max(W - 1, 1) - 1, 2 * xy[..., 1] / max(H - 1, 1) - 1], dim=-1)
+            view_logits = rearrange(sam3_per_view[:, view_idx], "b c h w -> b c h w")
+            sampled = F.grid_sample(view_logits.unsqueeze(0) if view_logits.dim() == 3 else view_logits,
+                                     coords.unsqueeze(2), mode="nearest", padding_mode="zeros", align_corners=True).squeeze(-1)
+            if sampled.dim() == 2:
+                sampled = sampled.unsqueeze(0)
+            per_view[:, view_idx, :, :C] = sampled.permute(0, 2, 1)  # [B, N, C]
+            per_view[:, view_idx, :, C] = visible.float()              # [B, N] visibility
+        # per_view: [B, V, N, C+1] where C+1 = [bg, fg, visibility]
+        gaussians.seg_per_view_logits = per_view.permute(0, 2, 1, 3)  # [B, N, V, C+1]
+        gaussians.seg_query_class_logits = per_view.mean(dim=1)[..., :C]  # [B, N, C]
         return gaussians
 
     def _assign_semantics_pixel_aligned(self, gaussians: Gaussians, sam3_output, H: int, W: int, voxel_inv_indices=None) -> Gaussians:

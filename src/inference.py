@@ -6,7 +6,7 @@ import torch
 from .config import load_config, resolve_project_path
 from .models.model import FusedSystem
 from .models.segmentation.sam3_segmenter import SAM3Segmenter
-from .utils.export_utils import export_all_outputs, export_depth_map, export_input_views, export_points_to_ply, export_segmentation_masks
+from .utils.export_utils import export_all_outputs, export_depth_map, export_input_views, export_points_to_ply, export_segmentation_masks, export_render_qc_logits, export_render_qc_foreground_heatmap
 from .data.dataset import SIU3RDataset, create_dataloader
 
 
@@ -116,7 +116,6 @@ def get_dataset(config: dict, refer_pair: str = None, prompt_mode: str = "text")
     img_size = image_size[0] if isinstance(image_size, list) else image_size
     dataset_root = resolve_project_path(data_cfg.get("dataset_root"))
     num_views = int(data_cfg.get("num_views", 3))
-    frame_stride = int(data_cfg.get("frame_stride", 1))
     max_samples = data_cfg.get("max_val_samples", data_cfg.get("max_train_samples"))
     if dataset_root and Path(dataset_root).exists():
         dataset = SIU3RDataset(
@@ -124,7 +123,6 @@ def get_dataset(config: dict, refer_pair: str = None, prompt_mode: str = "text")
             split=data_cfg.get("split", "train"),
             num_views=num_views,
             img_size=img_size,
-            frame_stride=frame_stride,
             max_samples=max_samples,
             refer_pair_path=refer_pair,
             prompt_mode=prompt_mode,

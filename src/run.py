@@ -21,14 +21,13 @@ def build_datasets(config: dict):
     img_size = image_size[0] if isinstance(image_size, list) else image_size
     dataset_root = resolve_project_path(data_cfg.get("dataset_root"))
     num_views = int(data_cfg.get("num_views", 3))
-    frame_stride = int(data_cfg.get("frame_stride", 1))
     max_train_samples = data_cfg.get("max_train_samples")
     max_val_samples = data_cfg.get("max_val_samples")
-    target_offset_mult = int(data_cfg.get("target_offset_mult", 2))
+    min_view_gap = int(data_cfg.get("min_view_gap", 3))
     split = data_cfg.get("split", "train")
     if dataset_root and Path(dataset_root).exists():
-        train_dataset = SIU3RDataset(dataset_root, split=split, num_views=num_views, img_size=img_size, frame_stride=frame_stride, max_samples=max_train_samples, target_offset_mult=target_offset_mult)
-        val_dataset = SIU3RDataset(dataset_root, split="val" if split == "train" else split, num_views=num_views, img_size=img_size, frame_stride=frame_stride, max_samples=max_val_samples, target_offset_mult=target_offset_mult)
+        train_dataset = SIU3RDataset(dataset_root, split=split, num_views=num_views, img_size=img_size, min_view_gap=min_view_gap, max_samples=max_train_samples)
+        val_dataset = SIU3RDataset(dataset_root, split="val" if split == "train" else split, num_views=num_views, img_size=img_size, min_view_gap=min_view_gap, max_samples=max_val_samples)
         if len(train_dataset) > 0:
             return train_dataset, val_dataset if len(val_dataset) > 0 else train_dataset
     mock = MockMultiViewDataset(num_samples=16, num_views=num_views, img_size=img_size)

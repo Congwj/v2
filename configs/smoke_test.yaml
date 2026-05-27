@@ -1,7 +1,7 @@
 defaults: []
 
 project: siu_pro_v2
-experiment: dev
+experiment: smoke_test
 wandb_mode: offline
 ckpt_path: null
 mode: train
@@ -9,35 +9,34 @@ seed: 0
 ignore_warnings: true
 
 trainer:
-  max_epochs: 20
+  max_epochs: 1
   accelerator: gpu
   strategy: auto
-  devices: 4
+  devices: 1
   accumulate_grad_batches: 1
   gradient_clip_val: 0.5
-  gradient_checkpointing: true
-  check_val_every_n_epoch: 100
-  log_every_n_steps: 5
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 1
   skip_sanity_check: true
   precision: "32"
 
 optimizer:
   lr: 5e-4
-  warm_up_epochs: 3
+  warm_up_epochs: 0
   weight_decay: 0.01
 
 training:
   batch_size: 1
-  num_epochs: 20
+  num_epochs: 1
   weight_depth_smoothness: 0.05
-  log_training_result_interval: 400
+  log_training_result_interval: 5
   feature_distill:
     enabled: true
     weight: 1.0
   use_vote_head: true
   dataloader:
-    num_workers: 2
-    pin_memory: true
+    num_workers: 0
+    pin_memory: false
 
 model:
   image_size: [448, 448]
@@ -78,5 +77,5 @@ data:
   num_views: 3
   pool_size: 20
   min_view_gap: 3
-  max_train_samples: 1000
-  max_val_samples: 64
+  max_train_samples: 8
+  max_val_samples: 4

@@ -88,17 +88,15 @@ class COLMAPDataset(MultiViewDataset):
 
 
 class SIU3RDataset(MultiViewDataset):
-    def __init__(self, data_root: str, split: str = "train", num_views: int = 3, img_size: int = 518, load_masks: bool = False, frame_stride: int = 1, max_samples: int | None = None, refer_pair_path: str | None = None, prompt_mode: str = "text", target_offset_mult: int = 20):
-        self.frame_stride = max(int(frame_stride), 1)
+    def __init__(self, data_root: str, split: str = "train", num_views: int = 3, img_size: int = 518, load_masks: bool = False, max_samples: int | None = None, refer_pair_path: str | None = None, prompt_mode: str = "text", min_view_gap: int = 3):
         self.max_samples = max_samples if max_samples is None else max(int(max_samples), 0)
         self.refer_pair_path = refer_pair_path
         self.prompt_mode = prompt_mode
-        self.target_offset_mult = target_offset_mult
+        self.min_view_gap = max(int(min_view_gap), 1)
         self.pre_extract_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../..", "data", "pre_extracted"))
         self.refer_annotations = self._load_refer_annotations(data_root, split)
         self.refer_text_index = self._build_refer_text_index(self.refer_annotations)
         super().__init__(data_root, split, num_views, img_size, load_masks)
-        # Filter out training samples with no valid text prompt
         if not self.refer_pair_path:
             self.samples = [s for s in self.samples if s.get("text_prompt")]
 
@@ -120,28 +118,26 @@ class SIU3RDataset(MultiViewDataset):
                     break
             if images_dir is None:
                 continue
+            image_files = sorted([os.path.join(images_dir, f) for f in os.listdir(images_dir) if f.endswith((".jpg", ".png", ".jpeg"))])
+            n_frames = len(image_files)
+            if n_frames < self.num_views * 2:
+                continue
             intrinsics_path = os.path.join(scene_path, "intrinsics.npy") if os.path.exists(os.path.join(scene_path, "intrinsics.npy")) else (os.path.join(scene_path, "intrinsic.txt") if os.path.exists(os.path.join(scene_path, "intrinsic.txt")) else None)
             extrinsics_path = os.path.join(scene_path, "extrinsics.npy") if os.path.exists(os.path.join(scene_path, "extrinsics.npy")) else (os.path.join(scene_path, "extrinsic") if os.path.exists(os.path.join(scene_path, "extrinsic")) else None)
-            image_files = sorted([os.path.join(images_dir, f) for f in os.listdir(images_dir) if f.endswith((".jpg", ".png", ".jpeg"))])
-            target_offset = self.num_views * self.target_offset_mult
-            for i in range(0, len(image_files), self.num_views * self.frame_stride):
+            # Each scene contributes multiple sampling opportunities
+            n_samples = max(1, min(n_frames // (self.num_views * 2), 200))
+            for _ in range(n_samples):
                 if self.max_samples is not None and len(samples) >= self.max_samples:
                     return samples
-                t = i + target_offset
-                has_target = t + self.num_views <= len(image_files)
-                if i + self.num_views <= len(image_files):
-                    samples.append({
-                        "scene_dir": scene_path,
-                        "image_files": image_files[i:i + self.num_views],
-                        "target_image_files": image_files[t:t + self.num_views] if has_target else [],
-                        "intrinsics_path": intrinsics_path,
-                        "extrinsics_path": extrinsics_path,
-                        "start_idx": i,
-                        "target_start_idx": t if has_target else i,
-                        "has_camera_params": intrinsics_path is not None and extrinsics_path is not None,
-                        "has_target_views": has_target,
-                        "text_prompt": self._select_refer_text_prompt(scene_dir, i) or self._load_text_prompt(scene_path) or None,
-                    })
+                samples.append({
+                    "scene_dir": scene_path,
+                    "n_frames": n_frames,
+                    "image_files": image_files,
+                    "intrinsics_path": intrinsics_path,
+                    "extrinsics_path": extrinsics_path,
+                    "has_camera_params": intrinsics_path is not None and extrinsics_path is not None,
+                    "text_prompt": self._select_refer_text_prompt(scene_dir, 0) or self._load_text_prompt(scene_path) or None,
+                })
         return samples
 
     def _find_scene_path(self, scene_id: str) -> str | None:
@@ -252,114 +248,130 @@ class SIU3RDataset(MultiViewDataset):
         print(f"[SIU3RDataset] loaded refer pair samples from {pair_path}: samples={len(samples)}, prompt_mode={self.prompt_mode}")
         return samples
 
+    def _sample_views(self, pool_size: int):
+        """Randomly sample source and target view indices from pool [0, pool_size) with minimum gap."""
+        import random
+        all_frames = list(range(pool_size))
+        random.shuffle(all_frames)
+        src_idx = []
+        tgt_idx = []
+        for f in all_frames:
+            if len(src_idx) < self.num_views:
+                if all(abs(f - s) >= self.min_view_gap for s in src_idx):
+                    src_idx.append(f)
+            elif len(tgt_idx) < self.num_views:
+                if all(abs(f - t) >= self.min_view_gap for t in tgt_idx) and all(abs(f - s) >= self.min_view_gap for s in src_idx):
+                    tgt_idx.append(f)
+            if len(src_idx) >= self.num_views and len(tgt_idx) >= self.num_views:
+                break
+        # Fallback
+        remaining = [f for f in all_frames if f not in src_idx and f not in tgt_idx]
+        if len(src_idx) < self.num_views:
+            src_idx.extend(remaining[:self.num_views - len(src_idx)])
+        if len(tgt_idx) < self.num_views:
+            remaining2 = [f for f in remaining if f not in src_idx]
+            tgt_idx.extend(remaining2[:self.num_views - len(tgt_idx)])
+        return sorted(src_idx), sorted(tgt_idx)
+
+    def _load_cameras_for_frames(self, intrinsics_path, extrinsics_path, frame_ids):
+        """Load camera params for specific frame indices."""
+        intrinsics = self._load_intrinsics_from_path(intrinsics_path)
+        extrinsics = self._load_extrinsics_from_path(extrinsics_path)
+        if intrinsics.dim() == 3:
+            if all(0 <= int(x) < intrinsics.shape[0] for x in frame_ids):
+                intrinsics = intrinsics[torch.tensor(frame_ids, dtype=torch.long)]
+            else:
+                intrinsics = intrinsics[frame_ids[0]:frame_ids[0] + len(frame_ids)]
+        elif intrinsics.dim() == 2:
+            intrinsics = intrinsics.unsqueeze(0).repeat(len(frame_ids), 1, 1)
+        if extrinsics.dim() == 3:
+            if all(0 <= int(x) < extrinsics.shape[0] for x in frame_ids):
+                extrinsics = extrinsics[torch.tensor(frame_ids, dtype=torch.long)]
+            else:
+                extrinsics = extrinsics[frame_ids[0]:frame_ids[0] + len(frame_ids)]
+        elif extrinsics.dim() == 2:
+            extrinsics = extrinsics.unsqueeze(0).repeat(len(frame_ids), 1, 1)
+        intrinsics = self._ensure_num_views(intrinsics, 3).float()
+        extrinsics = self._ensure_num_views(extrinsics, 4).float()
+        if intrinsics[:, 0, 0].abs().max() > 10.0:
+            intrinsics[:, 0, :] /= self.img_size
+            intrinsics[:, 1, :] /= self.img_size
+        intrinsics[:, 0, 2] = 0.5
+        intrinsics[:, 1, 2] = 0.5
+        return intrinsics, extrinsics
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.samples[idx]
         try:
-            images = []
-            for img_file in sample["image_files"]:
-                images.append(self._preprocess_image(img_file) if os.path.exists(img_file) else torch.randn(3, self.img_size, self.img_size))
-            images = torch.stack(images, dim=0)
-            if sample["has_camera_params"]:
-                intrinsics = self._load_intrinsics_from_path(sample["intrinsics_path"])
-                extrinsics = self._load_extrinsics_from_path(sample["extrinsics_path"])
-                start_idx = sample["start_idx"]
-                frame_ids = sample.get("frame_ids")
-                if intrinsics.dim() == 3:
-                    if isinstance(frame_ids, list) and all(0 <= int(x) < intrinsics.shape[0] for x in frame_ids):
-                        intrinsics = intrinsics[torch.tensor(frame_ids, dtype=torch.long)]
-                    else:
-                        intrinsics = intrinsics[start_idx:start_idx + self.num_views]
-                elif intrinsics.dim() == 2:
-                    intrinsics = intrinsics.unsqueeze(0).repeat(self.num_views, 1, 1)
-                if extrinsics.dim() == 3:
-                    if isinstance(frame_ids, list) and all(0 <= int(x) < extrinsics.shape[0] for x in frame_ids):
-                        extrinsics = extrinsics[torch.tensor(frame_ids, dtype=torch.long)]
-                    else:
-                        extrinsics = extrinsics[start_idx:start_idx + self.num_views]
-                elif extrinsics.dim() == 2:
-                    extrinsics = extrinsics.unsqueeze(0).repeat(self.num_views, 1, 1)
-                intrinsics = self._ensure_num_views(intrinsics, 3)
-                extrinsics = self._ensure_num_views(extrinsics, 4)
-                intrinsics = intrinsics.float()
-                extrinsics = extrinsics.float()
-                if intrinsics[:, 0, 0].abs().max() > 10.0:
-                    intrinsics[:, 0, :] /= self.img_size
-                    intrinsics[:, 1, :] /= self.img_size
-                intrinsics[:, 0, 2] = 0.5
-                intrinsics[:, 1, 2] = 0.5
+            scene_id = os.path.basename(sample.get("scene_dir", ""))
+            result = {}
+
+            # Two sample formats: pool-based (train) vs refer-pair (inference)
+            is_pool = "n_frames" in sample
+
+            if is_pool:
+                image_files = sample["image_files"]
+                pool_path = os.path.join(self.pre_extract_dir, f"{scene_id}_sam3.pt")
+                if os.path.exists(pool_path):
+                    pool_data = torch.load(pool_path, map_location="cpu", weights_only=True)
+                    frame_indices = pool_data.get("frame_indices", list(range(pool_data["query_class_logits"].shape[1])))
+                    pool_size = len(frame_indices)
+                    src_rel, tgt_rel = self._sample_views(pool_size)
+                    src_idx = [frame_indices[r] for r in src_rel]
+                    tgt_idx = [frame_indices[r] for r in tgt_rel]
+                    images = torch.stack([self._preprocess_image(image_files[i]) for i in src_idx], dim=0)
+                    target_images = torch.stack([self._preprocess_image(image_files[i]) for i in tgt_idx], dim=0)
+                    all_qc = pool_data["query_class_logits"]  # [1, 20, Q, C, H, W]
+                    result["sam3_query_class_logits"] = all_qc[:, src_rel, ...]
+                    result["target_sam3_query_class_logits"] = all_qc[:, tgt_rel, ...]
+                else:
+                    raise FileNotFoundError(f"Pool file not found: {pool_path}. Run scripts/pre_extract_sam3.py first.")
+            else:
+                # Refer-pair format: fixed image_files list
+                image_files = sample["image_files"]
+                src_idx = list(range(len(image_files)))
+                tgt_idx = list(range(len(image_files)))
+                images = torch.stack([self._preprocess_image(f) for f in image_files], dim=0)
+                target_images = images.clone()
+
+            # Load cameras
+            if sample.get("has_camera_params"):
+                intrinsics, extrinsics = self._load_cameras_for_frames(
+                    sample["intrinsics_path"], sample["extrinsics_path"], src_idx)
+                tgt_intrinsics, tgt_extrinsics = self._load_cameras_for_frames(
+                    sample["intrinsics_path"], sample["extrinsics_path"], tgt_idx)
             else:
                 intrinsics = torch.eye(3).unsqueeze(0).repeat(self.num_views, 1, 1)
-                intrinsics[:, 0, 0] = 500.0 / self.img_size
-                intrinsics[:, 1, 1] = 500.0 / self.img_size
-                intrinsics[:, 0, 2] = 0.5
-                intrinsics[:, 1, 2] = 0.5
+                intrinsics[:, 0, 0] = 500.0 / self.img_size; intrinsics[:, 1, 1] = 500.0 / self.img_size
+                intrinsics[:, 0, 2] = 0.5; intrinsics[:, 1, 2] = 0.5
                 extrinsics = torch.eye(4).unsqueeze(0).repeat(self.num_views, 1, 1)
+                tgt_intrinsics = intrinsics; tgt_extrinsics = extrinsics
+
             prompts = {"text": sample["text_prompt"]} if sample.get("text_prompt") else None
-            scene_id = os.path.basename(sample.get("scene_dir", ""))
-            start_idx = sample.get("start_idx", 0)
-            result = {
+            result.update({
                 "images": images,
                 "intrinsics": intrinsics,
                 "extrinsics": extrinsics,
                 "prompts": prompts,
                 "scene_id": scene_id,
-                "start_idx": start_idx,
-                "frame_ids": sample.get("frame_ids", list(range(start_idx, start_idx + self.num_views))),
-                "object_id": sample.get("object_id"),
-                "object_name": sample.get("object_name"),
-            }
-            # Load target views for novel-view render supervision
-            if sample.get("has_target_views") and sample.get("target_image_files"):
-                target_images = []
-                for img_file in sample["target_image_files"]:
-                    target_images.append(self._preprocess_image(img_file) if os.path.exists(img_file) else torch.randn(3, self.img_size, self.img_size))
-                result["target_images"] = torch.stack(target_images, dim=0)
-                # Load target camera params (different frames = different extrinsics)
-                if sample["has_camera_params"]:
-                    tgt_start = sample.get("target_start_idx", sample["start_idx"])
-                    tgt_intrinsics = self._load_intrinsics_from_path(sample["intrinsics_path"])
-                    tgt_extrinsics = self._load_extrinsics_from_path(sample["extrinsics_path"])
-                    if tgt_intrinsics.dim() == 3:
-                        tgt_intrinsics = tgt_intrinsics[tgt_start:tgt_start + self.num_views]
-                    elif tgt_intrinsics.dim() == 2:
-                        tgt_intrinsics = tgt_intrinsics.unsqueeze(0).repeat(self.num_views, 1, 1)
-                    if tgt_extrinsics.dim() == 3:
-                        tgt_extrinsics = tgt_extrinsics[tgt_start:tgt_start + self.num_views]
-                    elif tgt_extrinsics.dim() == 2:
-                        tgt_extrinsics = tgt_extrinsics.unsqueeze(0).repeat(self.num_views, 1, 1)
-                    tgt_intrinsics = self._ensure_num_views(tgt_intrinsics, 3).float()
-                    tgt_extrinsics = self._ensure_num_views(tgt_extrinsics, 4).float()
-                    if tgt_intrinsics[:, 0, 0].abs().max() > 1.0:
-                        tgt_intrinsics[:, 0, :] /= self.img_size
-                        tgt_intrinsics[:, 1, :] /= self.img_size
-                else:
-                    tgt_intrinsics = intrinsics
-                    tgt_extrinsics = extrinsics
-                result["target_intrinsics"] = tgt_intrinsics
-                result["target_extrinsics"] = tgt_extrinsics
-            pre_extract_path = os.path.join(self.pre_extract_dir, f"{scene_id}_{start_idx}_sam3_qc.pt")
-            if os.path.exists(pre_extract_path):
-                pre_data = torch.load(pre_extract_path, map_location="cpu", weights_only=True)
-                result["sam3_query_class_logits"] = pre_data["query_class_logits"]
-                result["sam3_seg_masks"] = pre_data.get("seg_masks")
-                result["sam3_query_scores"] = pre_data.get("query_scores")
-            # Target view pre-extracted SAM3
-            target_start = sample.get("target_start_idx", start_idx)
-            result["target_start_idx"] = target_start
-            target_feat_path = os.path.join(self.pre_extract_dir, f"{scene_id}_{target_start}_sam3_qc.pt")
-            if os.path.exists(target_feat_path) and target_start != start_idx:
-                target_pre = torch.load(target_feat_path, map_location="cpu", weights_only=True)
-                result["target_sam3_query_class_logits"] = target_pre["query_class_logits"]
+                "start_idx": src_idx[0] if src_idx else 0,
+                "frame_ids": src_idx,
+                "target_images": target_images,
+                "target_intrinsics": tgt_intrinsics,
+                "target_extrinsics": tgt_extrinsics,
+                "target_start_idx": tgt_idx[0] if tgt_idx else 0,
+            })
             return result
-        except Exception:
+        except Exception as e:
+            print(f"[SIU3RDataset] ERROR loading sample {idx}: {e}")
             images = torch.randn(self.num_views, 3, self.img_size, self.img_size)
             intrinsics = torch.eye(3).unsqueeze(0).repeat(self.num_views, 1, 1)
-            intrinsics[:, 0, 0] = 500.0 / self.img_size
-            intrinsics[:, 1, 1] = 500.0 / self.img_size
-            intrinsics[:, 0, 2] = 0.5
-            intrinsics[:, 1, 2] = 0.5
+            intrinsics[:, 0, 0] = 500.0 / self.img_size; intrinsics[:, 1, 1] = 500.0 / self.img_size
+            intrinsics[:, 0, 2] = 0.5; intrinsics[:, 1, 2] = 0.5
             extrinsics = torch.eye(4).unsqueeze(0).repeat(self.num_views, 1, 1)
-            return {"images": images, "intrinsics": intrinsics, "extrinsics": extrinsics, "prompts": None}
+            return {"images": images, "intrinsics": intrinsics, "extrinsics": extrinsics, "prompts": None,
+                    "scene_id": "", "start_idx": 0, "target_start_idx": 0, "frame_ids": [],
+                    "target_images": images, "target_intrinsics": intrinsics, "target_extrinsics": extrinsics}
 
     def _load_refer_annotations(self, data_root: str, split: str) -> Dict:
         import json
@@ -563,7 +575,7 @@ def create_dataloader(dataset: Dataset, batch_size: int = 2, num_workers: int = 
                 "prompts": None,
             }
         result = {}
-        skip_stack = {"sam3_query_class_logits", "sam3_seg_masks", "sam3_query_scores"}
+        skip_stack = {"sam3_query_class_logits", "target_sam3_query_class_logits", "sam3_seg_masks", "sam3_query_scores"}
         for key in batch[0].keys():
             values = [b[key] for b in batch]
             if values[0] is None:
